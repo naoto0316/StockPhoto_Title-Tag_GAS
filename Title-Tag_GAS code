@@ -1,0 +1,544 @@
+/***** CONFIG *****/
+const ROOT_FOLDER_ID = "1F_Byvx8MzyhFDqcZxbD4pyqunw4oy7nn";
+const PROCESS_FOLDER_NAME = "処理";
+const DONE_FOLDER_NAME = "完了";
+const ERROR_FOLDER_NAME = "失敗"; // optional
+
+const OPENAI_MODEL = "gpt-4o";
+
+// Safety controls
+const MAX_PER_RUN = 10;          // process up to N images per execution
+const SAFE_STOP_MS = 320000;     // stop around 5m20s (6min limit margin)
+
+// Title quality controls (JP)
+const JP_TITLE_BANNED_WORDS = [
+  "美しい","綺麗","きれい","感動","感動的","仕上げた","仕上がり","素敵","魅力","エモい","かわいい","可愛い",
+  "最高","最適","印象的","ドラマチック","幻想的","優雅","エレガント","ロマンチック","おしゃれ","オシャレ",
+  "心","気持ち","癒し","映える","映し出す","楽しむ","感じる","風景"
+];
+
+// JA tags must not contain English letters
+const EN_LETTER_RE = /[A-Za-z]/;
+
+/***** MAIN *****/
+function runPipeline() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000); // avoid overlapping executions
+  try {
+    const apiKey = PropertiesService.getScriptProperties().getProperty("OPENAI_API_KEY");
+    if (!apiKey) throw new Error("OPENAI_API_KEY is not set in Script Properties.");
+
+    const startMs = Date.now();
+
+    const root = DriveApp.getFolderById(ROOT_FOLDER_ID);
+    const processFolder = getOrCreateChildFolder_(root, PROCESS_FOLDER_NAME);
+    const doneFolder = getOrCreateChildFolder_(root, DONE_FOLDER_NAME);
+    const errorFolder = getOrCreateChildFolder_(root, ERROR_FOLDER_NAME);
+
+    // Get or create output spreadsheets for the current run
+    const runState = getOrCreateRunState_(root);
+    const ssJa = SpreadsheetApp.openById(runState.ssJaId);
+    const shJa = ssJa.getSheetByName("output_ja") || ssJa.getSheets()[0];
+
+    const ssEn = SpreadsheetApp.openById(runState.ssEnId);
+    const shEn = ssEn.getSheetByName("output_en") || ssEn.getSheets()[0];
+
+    let processed = 0;
+
+    const files = processFolder.getFiles();
+    while (files.hasNext()) {
+      // Safety stop by time
+      if (Date.now() - startMs > SAFE_STOP_MS) break;
+      // Safety stop by count
+      if (processed >= MAX_PER_RUN) break;
+
+      const file = files.next();
+      const mime = file.getMimeType();
+      if (!["image/jpeg", "image/png", "image/webp"].includes(mime)) continue;
+
+      try {
+        const imageDataUrl = makeDataUrl_(file.getBlob(), mime);
+
+        const meta = generateMetadataStrict_(apiKey, imageDataUrl);
+        const fixed = enforceRulesInGas_(apiKey, imageDataUrl, meta);
+
+        // append rows
+        shJa.getRange(shJa.getLastRow() + 1, 1, 1, buildHeaderJa_().length)
+          .setValues([buildRowJa_(file, fixed)]);
+        shEn.getRange(shEn.getLastRow() + 1, 1, 1, buildHeaderEn_().length)
+          .setValues([buildRowEn_(file, fixed)]);
+
+        // Move processed file to DONE
+        doneFolder.addFile(file);
+        processFolder.removeFile(file);
+
+        processed++;
+
+      } catch (e) {
+        // Move failed file to ERROR
+        try {
+          errorFolder.addFile(file);
+          processFolder.removeFile(file);
+        } catch (_) {}
+        console.error("[FAIL] " + file.getName() + ": " + e);
+      }
+    }
+
+    // If PROCESS folder is empty, finalize run state
+    if (!processFolder.getFiles().hasNext()) {
+      clearRunState_();
+    }
+
+    console.log("Processed this run: " + processed);
+
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/***** RUN STATE (resume) *****/
+function getOrCreateRunState_(rootFolder) {
+  const props = PropertiesService.getScriptProperties();
+  const existingJa = props.getProperty("ACTIVE_SS_JA_ID");
+  const existingEn = props.getProperty("ACTIVE_SS_EN_ID");
+
+  if (existingJa && existingEn) {
+    return { ssJaId: existingJa, ssEnId: existingEn };
+  }
+
+  const stamp = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyyMMdd_HHmm");
+
+  const ssJa = SpreadsheetApp.create("titles_tags_JA_" + stamp);
+  const shJa = ssJa.getSheets()[0];
+  shJa.setName("output_ja");
+  shJa.getRange(1, 1, 1, buildHeaderJa_().length).setValues([buildHeaderJa_()]);
+
+  const ssEn = SpreadsheetApp.create("titles_tags_EN_" + stamp);
+  const shEn = ssEn.getSheets()[0];
+  shEn.setName("output_en");
+  shEn.getRange(1, 1, 1, buildHeaderEn_().length).setValues([buildHeaderEn_()]);
+
+  // Move sheets to ROOT immediately so they remain even if later timeout happens
+  DriveApp.getFileById(ssJa.getId()).moveTo(rootFolder);
+  DriveApp.getFileById(ssEn.getId()).moveTo(rootFolder);
+
+  props.setProperty("ACTIVE_SS_JA_ID", ssJa.getId());
+  props.setProperty("ACTIVE_SS_EN_ID", ssEn.getId());
+
+  return { ssJaId: ssJa.getId(), ssEnId: ssEn.getId() };
+}
+
+function clearRunState_() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty("ACTIVE_SS_JA_ID");
+  props.deleteProperty("ACTIVE_SS_EN_ID");
+}
+
+/***** OPENAI (Structured Outputs via Responses API) *****/
+function generateMetadataStrict_(apiKey, imageDataUrl) {
+  const system = [
+    "You are a metadata creator for stock photos.",
+    "Output must strictly match the given JSON schema.",
+    "",
+    "JP title requirements:",
+    "- 15-30 Japanese characters.",
+    "- MUST be a noun phrase (a name-like caption), not a full sentence.",
+    "- Do NOT end with です/ます/である/だ, and do NOT use phrases like '〜の写真です'.",
+    "- Avoid verb endings such as している / 見ている / 撮影した / 映す.",
+    "- Describe the photo concretely as a caption (noun-leaning is OK).",
+    "- Avoid evaluative/emotional words (e.g., 美しい, 感動, 仕上げた) and avoid feeling-based expressions.",
+    "- Avoid keyword-stuffing; keep it a natural short description.",
+    "",
+    "JP tags requirements:",
+    "- Exactly 49 items, no duplicates.",
+    "- Japanese only. Do NOT include English letters (A-Z/a-z) anywhere.",
+    "- Do NOT include tokens like title_en, tags_en, or any JSON keys as tags.",
+    "",
+    "EN title/tags:",
+    "- English title: at least 5 words.",
+    "- English tags: exactly 49, no duplicates.",
+    "",
+    "Avoid overusing the word 日本 (prefer 0, max 1).",
+    "- Do NOT use the word '風景' in the Japanese title.",
+    "- Avoid generic fillers like '〜の風景'. Use specific nouns (e.g., 夜景, 街並み, 海岸線, 波, 高層ビル群, 橋, 砂浜)."
+  ].join("\n");
+
+  const schema = {
+    name: "photo_metadata",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        title_ja: { type: "string", minLength: 15, maxLength: 30 },
+        tags_ja: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } },
+        title_en: { type: "string", minLength: 1 },
+        tags_en: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } }
+      },
+      required: ["title_ja", "tags_ja", "title_en", "tags_en"]
+    }
+  };
+
+  const payload = {
+    model: OPENAI_MODEL,
+    input: [{
+      role: "system",
+      content: [{ type: "input_text", text: system }]
+    },{
+      role: "user",
+      content: [
+        { type: "input_text", text: "Generate title and tags for this image per the schema." },
+        { type: "input_image", image_url: imageDataUrl }
+      ]
+    }],
+    text: { format: { type: "json_schema", ...schema } }
+  };
+
+  const res = callOpenAI_(apiKey, payload);
+  const jsonText = extractOutputText_(res);
+  if (!jsonText) {
+    console.error("Empty output. Raw response (truncated): " + JSON.stringify(res).slice(0, 2000));
+    throw new Error("Model output is empty.");
+  }
+  return JSON.parse(jsonText);
+}
+
+/***** GAS ENFORCEMENT (critical) *****/
+function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
+  // normalize & de-dup
+  meta.title_ja = String(meta.title_ja || "").trim();
+  meta.title_en = String(meta.title_en || "").trim();
+  meta.tags_ja = uniq_(meta.tags_ja);
+  meta.tags_en = uniq_(meta.tags_en);
+
+  // HARD remove obvious junk in tags_ja (keys etc.)
+  meta.tags_ja = meta.tags_ja.filter(t => !isJunkTag_(t));
+
+  // Check JP title constraints
+  const needsJaLenFix = meta.title_ja.length < 15 || meta.title_ja.length > 30;
+  const needsJaBannedFix = containsBannedWord_(meta.title_ja, JP_TITLE_BANNED_WORDS);
+  const needsJaSentenceFix = isSentenceLikeJapaneseTitle_(meta.title_ja);
+
+  // Check JP tags constraints (must be 49, Japanese-only)
+  const hasEnglishInJaTags = meta.tags_ja.some(t => EN_LETTER_RE.test(String(t || "")));
+  const needsJaTagsCountFix = meta.tags_ja.length !== 49;
+
+  // Check EN title constraints
+  const enWords = meta.title_en.split(/\s+/).filter(Boolean).length;
+  const needsEnTitleFix = enWords < 5;
+
+  // Check EN tags constraints
+  const needsEnTagsFix = meta.tags_en.length !== 49;
+
+  // If everything OK, finalize
+  if (!needsJaLenFix && !needsJaBannedFix && !needsJaSentenceFix && !hasEnglishInJaTags && !needsJaTagsCountFix && !needsEnTitleFix && !needsEnTagsFix) {
+    meta.tags_ja = meta.tags_ja.slice(0, 49);
+    meta.tags_en = meta.tags_en.slice(0, 49);
+    return meta;
+  }
+
+  // Otherwise ask model to FIX with stronger constraints
+  const system = [
+    "You are a metadata editor for stock photos.",
+    "Fix the given JSON to satisfy constraints strictly.",
+    "",
+    "JP title:",
+    "- 15-30 Japanese characters.",
+    "- Concrete factual description (caption).",
+    "- Do NOT use evaluative/emotional words like 美しい/感動/仕上げた etc.",
+    "- Avoid keyword stuffing; keep natural.",
+    "",
+    "JP tags:",
+    "- Exactly 49 items, no duplicates.",
+    "- Japanese only: NEVER include English letters A-Z/a-z.",
+    "- Do NOT include tokens like title_en, tags_en, or any JSON keys.",
+    "",
+    "EN title/tags:",
+    "- English title: at least 5 words.",
+    "- English tags: exactly 49 items.",
+    "",
+    "Avoid overusing 日本 (prefer 0, max 1).",
+    "Output JSON only and must match the schema."
+  ].join("\n");
+
+  const schema = {
+    name: "photo_metadata",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        title_ja: { type: "string", minLength: 15, maxLength: 30 },
+        tags_ja: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } },
+        title_en: { type: "string", minLength: 1 },
+        tags_en: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } }
+      },
+      required: ["title_ja", "tags_ja", "title_en", "tags_en"]
+    }
+  };
+
+  const payload = {
+    model: OPENAI_MODEL,
+    input: [{
+      role: "system",
+      content: [{ type: "input_text", text: system }]
+    },{
+      role: "user",
+      content: [
+        { type: "input_text", text: "Fix this JSON to comply:\n" + JSON.stringify(meta) },
+        { type: "input_image", image_url: imageDataUrl }
+      ]
+    }],
+    text: { format: { type: "json_schema", ...schema } }
+  };
+
+  const res = callOpenAI_(apiKey, payload);
+  const fixedText = extractOutputText_(res);
+  if (!fixedText) {
+    console.error("Empty output (fix). Raw response (truncated): " + JSON.stringify(res).slice(0, 2000));
+    throw new Error("Model output is empty (fix).");
+  }
+
+  const out = JSON.parse(fixedText);
+
+  // Final hard enforcement (last line of defense)
+  out.title_ja = String(out.title_ja || "").trim();
+  out.tags_ja = uniq_(out.tags_ja).filter(t => !isJunkTag_(t)).filter(t => !EN_LETTER_RE.test(String(t || "")));
+  out.tags_en = uniq_(out.tags_en);
+
+  // If filtering broke counts, do ONE more repair call focusing only on JA tags
+  if (out.tags_ja.length !== 49 || containsBannedWord_(out.title_ja, JP_TITLE_BANNED_WORDS) || out.title_ja.length < 15 || out.title_ja.length > 30) {
+    return repairJaOnly_(apiKey, imageDataUrl, out);
+  }
+
+  out.tags_ja = out.tags_ja.slice(0, 49);
+  out.tags_en = out.tags_en.slice(0, 49);
+  return out;
+}
+
+/***** Targeted repair: JP title & JP tags only *****/
+function repairJaOnly_(apiKey, imageDataUrl, meta) {
+  const system = [
+    "You fix ONLY Japanese title and Japanese tags.",
+    "Return JSON matching schema. Keep existing English fields as-is.",
+    "",
+    "JP title:",
+    "- 15-30 Japanese characters.",
+    "- Concrete factual caption; noun-leaning OK.",
+    "- Do NOT use evaluative/emotional words: 美しい/感動/仕上げた/素敵/魅力/癒し 等。",
+    "- Avoid keyword stuffing.",
+    "",
+    "JP tags:",
+    "- Exactly 49 Japanese-only tags. Never include English letters A-Z/a-z.",
+    "- No duplicates. No JSON keys (title_en, tags_en etc.)."
+  ].join("\n");
+
+  const schema = {
+    name: "photo_metadata_ja_only",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        title_ja: { type: "string", minLength: 15, maxLength: 30 },
+        tags_ja: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } }
+      },
+      required: ["title_ja", "tags_ja"]
+    }
+  };
+
+  const payload = {
+    model: OPENAI_MODEL,
+    input: [{
+      role: "system",
+      content: [{ type: "input_text", text: system }]
+    },{
+      role: "user",
+      content: [
+        { type: "input_text", text: "Update JP fields based on this image. Current meta (EN keep same):\n" + JSON.stringify(meta) },
+        { type: "input_image", image_url: imageDataUrl }
+      ]
+    }],
+    text: { format: { type: "json_schema", ...schema } }
+  };
+
+  const res = callOpenAI_(apiKey, payload);
+  const txt = extractOutputText_(res);
+  if (!txt) throw new Error("Model output is empty (repairJaOnly).");
+
+  const ja = JSON.parse(txt);
+
+  meta.title_ja = String(ja.title_ja || "").trim();
+  meta.tags_ja = uniq_(ja.tags_ja).filter(t => !isJunkTag_(t)).filter(t => !EN_LETTER_RE.test(String(t || ""))).slice(0, 49);
+
+  // If still not 49 for any reason, pad by asking again is expensive; instead throw for visibility
+  if (meta.tags_ja.length !== 49) throw new Error("JP tags count is not 49 after repair.");
+
+  // final banned-word check
+  if (containsBannedWord_(meta.title_ja, JP_TITLE_BANNED_WORDS)) throw new Error("JP title still contains banned words after repair.");
+  if (meta.title_ja.length < 15 || meta.title_ja.length > 30) throw new Error("JP title length out of range after repair.");
+
+  return meta;
+}
+
+/***** OPENAI low-level *****/
+function callOpenAI_(apiKey, payload) {
+  const url = "https://api.openai.com/v1/responses";
+  const res = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    headers: { Authorization: "Bearer " + apiKey },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const text = res.getContentText();
+  if (res.getResponseCode() >= 400) throw new Error("OpenAI error " + res.getResponseCode() + ": " + text);
+  return JSON.parse(text);
+}
+
+function extractOutputText_(res) {
+  if (res && typeof res.output_text === "string" && res.output_text.trim()) return res.output_text.trim();
+  const outputs = (res && res.output) ? res.output : [];
+  for (const out of outputs) {
+    const contents = out.content || [];
+    for (const c of contents) {
+      if (c && typeof c.text === "string" && c.text.trim()) return c.text.trim();
+    }
+  }
+  return "";
+}
+
+/***** COLUMNS (your format) *****/
+function buildHeaderJa_() {
+  return ["Filename", "Title", "Keywords", "Category", "Releases"];
+}
+function buildHeaderEn_() {
+  return ["Filename", "Description", "Keywords", "Categories", "Editorial", "Mature content", "illustration"];
+}
+
+function buildRowJa_(file, meta) {
+  return [file.getName(), meta.title_ja, meta.tags_ja.join(","), "", ""];
+}
+function buildRowEn_(file, meta) {
+  return [file.getName(), meta.title_en, meta.tags_en.join(","), "nature", "no", "yes", "no"];
+}
+
+/***** UTILS *****/
+function getOrCreateChildFolder_(parent, name) {
+  const it = parent.getFoldersByName(name);
+  return it.hasNext() ? it.next() : parent.createFolder(name);
+}
+
+function isSentenceLikeJapaneseTitle_(title) {
+  const t = String(title || "").trim();
+
+  // 明らかな“文章”終わり（丁寧語／断定）
+  if (/(です|ます|でした|ました|である|だ)$/.test(t)) return true;
+
+  // 「〜の写真です」「〜の画像です」系（よく出る）
+  if (/(写真|画像|風景)(です|である)$/.test(t)) return true;
+
+  // 動詞・述語で終わっているっぽい（名詞タイトルにしたいのでNG）
+  // 例：〜している / 〜見ている / 〜撮影した / 〜映す など
+  if (/(している|していた|しているところ|している様子|している風景)$/.test(t)) return true;
+  if (/(見ている|眺める|歩く|走る|座る|立つ|撮影した|捉えた|映す|映した|表現した|描いた)$/.test(t)) return true;
+
+  // 「〜です。」のような句点付きも文章扱い
+  if (/[。\.]$/.test(t)) return true;
+
+  // 「～の風景」という表現も除外
+  if (/の風景$/.test(t)) return true;
+
+  return false;
+}
+
+function makeDataUrl_(blob, mime) {
+  const b64 = Utilities.base64Encode(blob.getBytes());
+  return "data:" + mime + ";base64," + b64;
+}
+
+function uniq_(arr) {
+  const seen = new Set();
+  const out = [];
+  (arr || []).forEach(s => {
+    const v = String(s || "").trim();
+    if (!v) return;
+    if (seen.has(v)) return;
+    seen.add(v);
+    out.push(v);
+  });
+  return out;
+}
+
+function countWordOccurrences_(text, word) {
+  const re = new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
+  const m = String(text || "").match(re);
+  return m ? m.length : 0;
+}
+
+function containsBannedWord_(text, bannedList) {
+  const t = String(text || "");
+  return bannedList.some(w => t.indexOf(w) !== -1);
+}
+
+function isJunkTag_(tag) {
+  const t = String(tag || "").trim();
+  if (!t) return true;
+  const lowered = t.toLowerCase();
+  // prevent JSON keys / accidental tokens
+  if (lowered === "title_en" || lowered === "tags_en" || lowered === "title_ja" || lowered === "tags_ja") return true;
+  if (t === "title_en" || t === "tags_en" || t === "title_ja" || t === "tags_ja") return true;
+  return false;
+}
+
+/**
+ * スプレッドシートを開いたときにメニューを追加
+ */
+function onOpen(e) {
+  SpreadsheetApp.getUi()
+    .createMenu("画像処理")
+    .addItem("処理を実行（タイトル＆タグ生成）", "runPipeline")
+    .addSeparator()
+    .addItem("処理フォルダの残り枚数を表示", "menu_showRemainingCount")
+    .addSeparator()
+    .addItem("実行状態をリセット（RunState削除）", "menu_clearRunState")
+    .addToUi();
+}
+
+/**
+ * RunStateを消して、次回実行時に新しいスプレッドシートを作り直したい時用
+ */
+function menu_clearRunState() {
+  clearRunState_(); // 既存のあなたの関数を呼ぶ
+  SpreadsheetApp.getUi().alert("実行状態（RunState）をリセットしました。次回実行で新しい出力シートが作られます。");
+}
+
+function menu_showRemainingCount() {
+  const root = DriveApp.getFolderById(ROOT_FOLDER_ID);
+  const processFolder = getOrCreateChildFolder_(root, PROCESS_FOLDER_NAME);
+
+  let total = 0;
+  let imageCount = 0;
+  let nonImageCount = 0;
+
+  const files = processFolder.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    total++;
+
+    const mime = f.getMimeType();
+    const isImage = (mime === "image/jpeg" || mime === "image/png" || mime === "image/webp");
+
+    if (isImage) imageCount++;
+    else nonImageCount++;
+  }
+
+  const msg =
+    "処理フォルダ内の残り件数\n\n" +
+    "合計: " + total + " 件\n" +
+    "画像: " + imageCount + " 件\n" +
+    "画像以外: " + nonImageCount + " 件";
+
+  SpreadsheetApp.getUi().alert(msg);
+}
