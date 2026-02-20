@@ -303,7 +303,7 @@ function generateMetadataStrict_(apiKey, imageDataUrl) {
     console.error("Empty output. Raw response (truncated): " + JSON.stringify(res).slice(0, 2000));
     throw new Error("Model output is empty.");
   }
-  return JSON.parse(jsonText);
+  return safeJsonParse_(jsonText);
 }
 
 function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
@@ -415,7 +415,7 @@ function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
     throw new Error("Model output is empty (fix).");
   }
 
-  const out = JSON.parse(fixedText);
+  const out = safeJsonParse_(fixedText);
 
   // final sanitize
   out.title_ja = String(out.title_ja || "").trim();
@@ -496,7 +496,7 @@ function repairJaOnly_(apiKey, imageDataUrl, meta) {
   const txt = extractOutputText_(res);
   if (!txt) throw new Error("Model output is empty (repairJaOnly).");
 
-  const ja = JSON.parse(txt);
+  const ja = safeJsonParse_(txt);
 
   meta.title_ja = String(ja.title_ja || "").trim();
   meta.tags_ja = sanitizeJapaneseTags_(uniq_(ja.tags_ja)).slice(0, 49);
@@ -558,6 +558,36 @@ function buildRowEn_(file, meta) {
 function getOrCreateChildFolder_(parent, name) {
   const it = parent.getFoldersByName(name);
   return it.hasNext() ? it.next() : parent.createFolder(name);
+}
+
+function safeJsonParse_(text) {
+  const raw = String(text || "").trim();
+  if (!raw) throw new Error("safeJsonParse_: empty text");
+
+  // 1) code fence を除去
+  let s = raw
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  // 2) そのままJSONとして読めるなら読む
+  try {
+    return JSON.parse(s);
+  } catch (_) {}
+
+  // 3) 文字列中の「最初の { 」から「最後の } 」までを抜き出して再挑戦
+  const first = s.indexOf("{");
+  const last = s.lastIndexOf("}");
+  if (first !== -1 && last !== -1 && last > first) {
+    const sliced = s.slice(first, last + 1);
+    try {
+      return JSON.parse(sliced);
+    } catch (e) {
+      throw new Error("safeJsonParse_: invalid JSON after slicing: " + e + "\nRAW(head): " + raw.slice(0, 300));
+    }
+  }
+
+  throw new Error("safeJsonParse_: no JSON object found.\nRAW(head): " + raw.slice(0, 300));
 }
 
 function makeDataUrl_(blob, mime) {
