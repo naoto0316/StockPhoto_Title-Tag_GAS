@@ -4,26 +4,103 @@ const PROCESS_FOLDER_NAME = "処理";
 const DONE_FOLDER_NAME = "完了";
 const ERROR_FOLDER_NAME = "失敗"; // optional
 
+// ✅ precision priority
 const OPENAI_MODEL = "gpt-4o";
 
 // Safety controls
 const MAX_PER_RUN = 10;          // process up to N images per execution
 const SAFE_STOP_MS = 320000;     // stop around 5m20s (6min limit margin)
 
-// Title quality controls (JP)
+// Japanese title ban list（主観/感情/演出＋冗長語）
 const JP_TITLE_BANNED_WORDS = [
   "美しい","綺麗","きれい","感動","感動的","仕上げた","仕上がり","素敵","魅力","エモい","かわいい","可愛い",
   "最高","最適","印象的","ドラマチック","幻想的","優雅","エレガント","ロマンチック","おしゃれ","オシャレ",
-  "心","気持ち","癒し","映える","映し出す","楽しむ","感じる","風景"
+  "心","気持ち","癒し","映える","映し出す","楽しむ","感じる",
+  "風景" // ✅ avoid generic filler
 ];
 
-// JA tags must not contain English letters
 const EN_LETTER_RE = /[A-Za-z]/;
 
-/***** MAIN *****/
+/***** SPREADSHEET MENU *****/
+function onOpen(e) {
+  SpreadsheetApp.getUi()
+    .createMenu("画像処理")
+    .addItem("処理を実行（タイトル＆タグ生成）", "menu_runPipeline")
+    .addSeparator()
+    .addItem("処理フォルダの残り枚数を表示", "menu_showRemainingCount")
+    .addItem("失敗ログを開く", "menu_openFailLog")
+    .addSeparator()
+    .addItem("実行状態をリセット（RunState削除）", "menu_clearRunState")
+    .addToUi();
+}
+
+function menu_runPipeline() {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const summary = runPipelineWithSummary_();
+    SpreadsheetApp.getActive().toast(summary, "画像処理", 8);
+    ui.alert(summary);
+  } catch (e) {
+    const msg = "実行中にエラーが発生しました。\n\n" + String(e);
+    SpreadsheetApp.getActive().toast(msg, "画像処理（エラー）", 10);
+    ui.alert(msg);
+    throw e; // Executionsにも残す
+  }
+}
+
+function menu_showRemainingCount() {
+  const root = DriveApp.getFolderById(ROOT_FOLDER_ID);
+  const processFolder = getOrCreateChildFolder_(root, PROCESS_FOLDER_NAME);
+
+  let total = 0, imageCount = 0, nonImageCount = 0;
+  const files = processFolder.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    total++;
+    const mime = f.getMimeType();
+    const isImage = (mime === "image/jpeg" || mime === "image/png" || mime === "image/webp");
+    if (isImage) imageCount++; else nonImageCount++;
+  }
+
+  SpreadsheetApp.getUi().alert(
+    "処理フォルダ内の残り件数\n\n" +
+    "合計: " + total + " 件\n" +
+    "画像: " + imageCount + " 件\n" +
+    "画像以外: " + nonImageCount + " 件"
+  );
+}
+
+function menu_openFailLog() {
+  const ssJaId = PropertiesService.getScriptProperties().getProperty("ACTIVE_SS_JA_ID");
+  if (!ssJaId) {
+    SpreadsheetApp.getUi().alert("まだ出力スプレッドシートが作成されていません。先に一度実行してください。");
+    return;
+  }
+  const ss = SpreadsheetApp.openById(ssJaId);
+  const sh = ss.getSheetByName("fail_log");
+  if (!sh) {
+    SpreadsheetApp.getUi().alert("失敗ログはまだありません（fail_logシートが存在しません）。");
+    return;
+  }
+  ss.setActiveSheet(sh);
+  SpreadsheetApp.getUi().alert("fail_log シートを開きました。");
+}
+
+function menu_clearRunState() {
+  clearRunState_();
+  SpreadsheetApp.getUi().alert("実行状態（RunState）をリセットしました。次回実行で新しい出力シートが作成されます。");
+}
+
+/***** MAIN (callable without UI) *****/
+// 互換のため残しておく（手動実行/トリガー用）
 function runPipeline() {
+  runPipelineWithSummary_();
+}
+
+/***** MAIN with UI summary + fail log *****/
+function runPipelineWithSummary_() {
   const lock = LockService.getScriptLock();
-  lock.waitLock(30000); // avoid overlapping executions
+  lock.waitLock(30000);
   try {
     const apiKey = PropertiesService.getScriptProperties().getProperty("OPENAI_API_KEY");
     if (!apiKey) throw new Error("OPENAI_API_KEY is not set in Script Properties.");
@@ -35,8 +112,9 @@ function runPipeline() {
     const doneFolder = getOrCreateChildFolder_(root, DONE_FOLDER_NAME);
     const errorFolder = getOrCreateChildFolder_(root, ERROR_FOLDER_NAME);
 
-    // Get or create output spreadsheets for the current run
+    // RunState: keep same output sheets across multiple runs
     const runState = getOrCreateRunState_(root);
+
     const ssJa = SpreadsheetApp.openById(runState.ssJaId);
     const shJa = ssJa.getSheetByName("output_ja") || ssJa.getSheets()[0];
 
@@ -44,12 +122,15 @@ function runPipeline() {
     const shEn = ssEn.getSheetByName("output_en") || ssEn.getSheets()[0];
 
     let processed = 0;
+    let failed = 0;
+
+    // batch write to reduce execution time
+    const rowsJa = [];
+    const rowsEn = [];
 
     const files = processFolder.getFiles();
     while (files.hasNext()) {
-      // Safety stop by time
       if (Date.now() - startMs > SAFE_STOP_MS) break;
-      // Safety stop by count
       if (processed >= MAX_PER_RUN) break;
 
       const file = files.next();
@@ -62,34 +143,48 @@ function runPipeline() {
         const meta = generateMetadataStrict_(apiKey, imageDataUrl);
         const fixed = enforceRulesInGas_(apiKey, imageDataUrl, meta);
 
-        // append rows
-        shJa.getRange(shJa.getLastRow() + 1, 1, 1, buildHeaderJa_().length)
-          .setValues([buildRowJa_(file, fixed)]);
-        shEn.getRange(shEn.getLastRow() + 1, 1, 1, buildHeaderEn_().length)
-          .setValues([buildRowEn_(file, fixed)]);
+        rowsJa.push(buildRowJa_(file, fixed));
+        rowsEn.push(buildRowEn_(file, fixed));
 
-        // Move processed file to DONE
+        // move processed file
         doneFolder.addFile(file);
         processFolder.removeFile(file);
 
         processed++;
 
       } catch (e) {
-        // Move failed file to ERROR
+        failed++;
+        try { logFailure_(ssJa.getId(), file.getName(), e); } catch (_) {}
+
         try {
           errorFolder.addFile(file);
           processFolder.removeFile(file);
         } catch (_) {}
+
         console.error("[FAIL] " + file.getName() + ": " + e);
       }
     }
 
-    // If PROCESS folder is empty, finalize run state
+    // write accumulated rows
+    if (rowsJa.length > 0) {
+      const startRowJa = shJa.getLastRow() + 1;
+      shJa.getRange(startRowJa, 1, rowsJa.length, buildHeaderJa_().length).setValues(rowsJa);
+    }
+    if (rowsEn.length > 0) {
+      const startRowEn = shEn.getLastRow() + 1;
+      shEn.getRange(startRowEn, 1, rowsEn.length, buildHeaderEn_().length).setValues(rowsEn);
+    }
+
+    // if no more files, clear run state
     if (!processFolder.getFiles().hasNext()) {
       clearRunState_();
     }
 
-    console.log("Processed this run: " + processed);
+    const sec = Math.round((Date.now() - startMs) / 1000);
+    const summary = `完了：${processed} 件 / 失敗：${failed} 件（所要 ${sec} 秒）`;
+
+    console.log(summary);
+    return summary;
 
   } finally {
     lock.releaseLock();
@@ -118,7 +213,7 @@ function getOrCreateRunState_(rootFolder) {
   shEn.setName("output_en");
   shEn.getRange(1, 1, 1, buildHeaderEn_().length).setValues([buildHeaderEn_()]);
 
-  // Move sheets to ROOT immediately so they remain even if later timeout happens
+  // move to ROOT so sheets survive even if later timeout happens
   DriveApp.getFileById(ssJa.getId()).moveTo(rootFolder);
   DriveApp.getFileById(ssEn.getId()).moveTo(rootFolder);
 
@@ -134,33 +229,36 @@ function clearRunState_() {
   props.deleteProperty("ACTIVE_SS_EN_ID");
 }
 
+/***** FAIL LOG *****/
+function logFailure_(ssJaId, filename, err) {
+  const ss = SpreadsheetApp.openById(ssJaId);
+  const sh = ss.getSheetByName("fail_log") || ss.insertSheet("fail_log");
+  if (sh.getLastRow() === 0) sh.appendRow(["Time", "Filename", "Error"]);
+
+  const msg = (err && err.stack) ? err.stack : String(err);
+  sh.appendRow([new Date(), filename, msg.slice(0, 1000)]);
+}
+
 /***** OPENAI (Structured Outputs via Responses API) *****/
 function generateMetadataStrict_(apiKey, imageDataUrl) {
   const system = [
-    "You are a metadata creator for stock photos.",
-    "Output must strictly match the given JSON schema.",
+    "You create stock photo metadata.",
+    "Output must strictly match the JSON schema.",
     "",
-    "JP title requirements:",
+    "[Japanese title rules]",
     "- 15-30 Japanese characters.",
     "- MUST be a noun phrase (a name-like caption), not a full sentence.",
     "- Do NOT end with です/ます/である/だ, and do NOT use phrases like '〜の写真です'.",
-    "- Avoid verb endings such as している / 見ている / 撮影した / 映す.",
-    "- Describe the photo concretely as a caption (noun-leaning is OK).",
-    "- Avoid evaluative/emotional words (e.g., 美しい, 感動, 仕上げた) and avoid feeling-based expressions.",
-    "- Avoid keyword-stuffing; keep it a natural short description.",
-    "",
-    "JP tags requirements:",
-    "- Exactly 49 items, no duplicates.",
-    "- Japanese only. Do NOT include English letters (A-Z/a-z) anywhere.",
-    "- Do NOT include tokens like title_en, tags_en, or any JSON keys as tags.",
-    "",
-    "EN title/tags:",
-    "- English title: at least 5 words.",
-    "- English tags: exactly 49, no duplicates.",
-    "",
-    "Avoid overusing the word 日本 (prefer 0, max 1).",
+    "- Avoid verb endings such as している / 見ている / 撮影した / 捉えた / 映す.",
+    "- Do NOT use evaluative/emotional words (e.g., 美しい, 感動, 仕上げた).",
     "- Do NOT use the word '風景' in the Japanese title.",
-    "- Avoid generic fillers like '〜の風景'. Use specific nouns (e.g., 夜景, 街並み, 海岸線, 波, 高層ビル群, 橋, 砂浜)."
+    "",
+    "[Tags rules]",
+    "- Japanese tags: exactly 49 items, no duplicates.",
+    "- Japanese tags must be Japanese-only. Do NOT include any English letters (A-Z/a-z).",
+    "- English title: at least 5 words.",
+    "- English tags: exactly 49 items, no duplicates.",
+    "- Avoid overusing the word 日本 (prefer 0, max 1)."
   ].join("\n");
 
   const schema = {
@@ -170,8 +268,13 @@ function generateMetadataStrict_(apiKey, imageDataUrl) {
       type: "object",
       additionalProperties: false,
       properties: {
-        title_ja: { type: "string", minLength: 15, maxLength: 30 },
-        tags_ja: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } },
+        title_ja: { type: "string", minLength: 1 },
+        tags_ja: {
+          type: "array",
+          minItems: 49,
+          maxItems: 49,
+          items: { type: "string", minLength: 1, pattern: "^(?!.*[A-Za-z]).+$" } // ✅ no English letters
+        },
         title_en: { type: "string", minLength: 1 },
         tags_en: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } }
       },
@@ -203,62 +306,61 @@ function generateMetadataStrict_(apiKey, imageDataUrl) {
   return JSON.parse(jsonText);
 }
 
-/***** GAS ENFORCEMENT (critical) *****/
 function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
-  // normalize & de-dup
   meta.title_ja = String(meta.title_ja || "").trim();
   meta.title_en = String(meta.title_en || "").trim();
+
   meta.tags_ja = uniq_(meta.tags_ja);
   meta.tags_en = uniq_(meta.tags_en);
 
-  // HARD remove obvious junk in tags_ja (keys etc.)
-  meta.tags_ja = meta.tags_ja.filter(t => !isJunkTag_(t));
+  // hard sanitize tags_ja
+  meta.tags_ja = sanitizeJapaneseTags_(meta.tags_ja);
 
-  // Check JP title constraints
+  // checks
   const needsJaLenFix = meta.title_ja.length < 15 || meta.title_ja.length > 30;
   const needsJaBannedFix = containsBannedWord_(meta.title_ja, JP_TITLE_BANNED_WORDS);
   const needsJaSentenceFix = isSentenceLikeJapaneseTitle_(meta.title_ja);
+  const needsJaNoFukeiPatternFix = /の風景$/.test(meta.title_ja); // extra guard
 
-  // Check JP tags constraints (must be 49, Japanese-only)
   const hasEnglishInJaTags = meta.tags_ja.some(t => EN_LETTER_RE.test(String(t || "")));
-  const needsJaTagsCountFix = meta.tags_ja.length !== 49;
+  const needsJaTagsFix = hasEnglishInJaTags || (meta.tags_ja.length !== 49);
 
-  // Check EN title constraints
   const enWords = meta.title_en.split(/\s+/).filter(Boolean).length;
   const needsEnTitleFix = enWords < 5;
 
-  // Check EN tags constraints
   const needsEnTagsFix = meta.tags_en.length !== 49;
 
-  // If everything OK, finalize
-  if (!needsJaLenFix && !needsJaBannedFix && !needsJaSentenceFix && !hasEnglishInJaTags && !needsJaTagsCountFix && !needsEnTitleFix && !needsEnTagsFix) {
+  const needsJaTitleFix = needsJaLenFix || needsJaBannedFix || needsJaSentenceFix || needsJaNoFukeiPatternFix;
+
+  if (!needsJaTitleFix && !needsJaTagsFix && !needsEnTitleFix && !needsEnTagsFix) {
     meta.tags_ja = meta.tags_ja.slice(0, 49);
     meta.tags_en = meta.tags_en.slice(0, 49);
     return meta;
   }
 
-  // Otherwise ask model to FIX with stronger constraints
+  // Fix prompt
   const system = [
-    "You are a metadata editor for stock photos.",
-    "Fix the given JSON to satisfy constraints strictly.",
+    "You are a stock photo metadata editor.",
+    "Fix the given JSON to satisfy constraints.",
     "",
-    "JP title:",
+    "[Japanese title rules]",
     "- 15-30 Japanese characters.",
-    "- Concrete factual description (caption).",
+    "- MUST be a noun phrase (name-like caption), not a sentence.",
+    "- Do NOT end with です/ます/である/だ, and do NOT use phrases like '〜の写真です'.",
+    "- Avoid verb endings such as している / 見ている / 撮影した / 捉えた / 映す.",
     "- Do NOT use evaluative/emotional words like 美しい/感動/仕上げた etc.",
-    "- Avoid keyword stuffing; keep natural.",
+    "- Do NOT use the word '風景' and avoid the pattern '〜の風景'.",
     "",
-    "JP tags:",
-    "- Exactly 49 items, no duplicates.",
-    "- Japanese only: NEVER include English letters A-Z/a-z.",
-    "- Do NOT include tokens like title_en, tags_en, or any JSON keys.",
+    "[Japanese tags rules]",
+    "- Exactly 49 items, Japanese-only, no duplicates.",
+    "- NEVER include English letters A-Z/a-z in Japanese tags.",
     "",
-    "EN title/tags:",
-    "- English title: at least 5 words.",
-    "- English tags: exactly 49 items.",
+    "[English rules]",
+    "- English title must be at least 5 words.",
+    "- English tags: exactly 49, no duplicates.",
     "",
     "Avoid overusing 日本 (prefer 0, max 1).",
-    "Output JSON only and must match the schema."
+    "Output must strictly match the schema JSON only."
   ].join("\n");
 
   const schema = {
@@ -268,14 +370,28 @@ function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
       type: "object",
       additionalProperties: false,
       properties: {
-        title_ja: { type: "string", minLength: 15, maxLength: 30 },
-        tags_ja: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } },
+        title_ja: { type: "string", minLength: 1 },
+        tags_ja: {
+          type: "array",
+          minItems: 49,
+          maxItems: 49,
+          items: { type: "string", minLength: 1, pattern: "^(?!.*[A-Za-z]).+$" }
+        },
         title_en: { type: "string", minLength: 1 },
         tags_en: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } }
       },
       required: ["title_ja", "tags_ja", "title_en", "tags_en"]
     }
   };
+
+  const issues = [];
+  if (needsJaLenFix) issues.push("JP title length must be 15-30.");
+  if (needsJaBannedFix) issues.push("JP title contains banned subjective/generic words.");
+  if (needsJaSentenceFix) issues.push("JP title must be noun phrase; no です/ます and no verb endings.");
+  if (needsJaNoFukeiPatternFix) issues.push("Avoid '〜の風景'.");
+  if (needsJaTagsFix) issues.push("JP tags must be 49 and Japanese-only (no English letters).");
+  if (needsEnTitleFix) issues.push("EN title must be >= 5 words.");
+  if (needsEnTagsFix) issues.push("EN tags must be exactly 49.");
 
   const payload = {
     model: OPENAI_MODEL,
@@ -285,7 +401,7 @@ function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
     },{
       role: "user",
       content: [
-        { type: "input_text", text: "Fix this JSON to comply:\n" + JSON.stringify(meta) },
+        { type: "input_text", text: "Fix this JSON.\nIssues:\n- " + issues.join("\n- ") + "\n\nJSON:\n" + JSON.stringify(meta) },
         { type: "input_image", image_url: imageDataUrl }
       ]
     }],
@@ -301,36 +417,45 @@ function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
 
   const out = JSON.parse(fixedText);
 
-  // Final hard enforcement (last line of defense)
+  // final sanitize
   out.title_ja = String(out.title_ja || "").trim();
-  out.tags_ja = uniq_(out.tags_ja).filter(t => !isJunkTag_(t)).filter(t => !EN_LETTER_RE.test(String(t || "")));
-  out.tags_en = uniq_(out.tags_en);
+  out.title_en = String(out.title_en || "").trim();
+  out.tags_ja = sanitizeJapaneseTags_(uniq_(out.tags_ja)).slice(0, 49);
+  out.tags_en = uniq_(out.tags_en).slice(0, 49);
 
-  // If filtering broke counts, do ONE more repair call focusing only on JA tags
-  if (out.tags_ja.length !== 49 || containsBannedWord_(out.title_ja, JP_TITLE_BANNED_WORDS) || out.title_ja.length < 15 || out.title_ja.length > 30) {
+  // If still violated, do targeted JP repair
+  const stillBad =
+    out.title_ja.length < 15 || out.title_ja.length > 30 ||
+    containsBannedWord_(out.title_ja, JP_TITLE_BANNED_WORDS) ||
+    isSentenceLikeJapaneseTitle_(out.title_ja) ||
+    /風景/.test(out.title_ja) ||
+    /の風景$/.test(out.title_ja) ||
+    out.tags_ja.length !== 49;
+
+  if (stillBad) {
     return repairJaOnly_(apiKey, imageDataUrl, out);
   }
 
-  out.tags_ja = out.tags_ja.slice(0, 49);
-  out.tags_en = out.tags_en.slice(0, 49);
   return out;
 }
 
-/***** Targeted repair: JP title & JP tags only *****/
+// Targeted repair: JP title & JP tags only
 function repairJaOnly_(apiKey, imageDataUrl, meta) {
   const system = [
     "You fix ONLY Japanese title and Japanese tags.",
-    "Return JSON matching schema. Keep existing English fields as-is.",
+    "Return JSON matching schema. Keep English fields unchanged.",
     "",
-    "JP title:",
+    "[Japanese title rules]",
     "- 15-30 Japanese characters.",
-    "- Concrete factual caption; noun-leaning OK.",
-    "- Do NOT use evaluative/emotional words: 美しい/感動/仕上げた/素敵/魅力/癒し 等。",
-    "- Avoid keyword stuffing.",
+    "- MUST be a noun phrase (name-like caption), not a sentence.",
+    "- Do NOT end with です/ます/である/だ, and do NOT use '〜の写真です'.",
+    "- Avoid verb endings such as している / 見ている / 撮影した / 捉えた / 映す.",
+    "- Avoid evaluative/emotional words (美しい/感動/仕上げた etc.).",
+    "- Do NOT use the word '風景' and avoid '〜の風景'.",
     "",
-    "JP tags:",
-    "- Exactly 49 Japanese-only tags. Never include English letters A-Z/a-z.",
-    "- No duplicates. No JSON keys (title_en, tags_en etc.)."
+    "[Japanese tags rules]",
+    "- Exactly 49 items, Japanese-only, no duplicates.",
+    "- NEVER include English letters A-Z/a-z in Japanese tags."
   ].join("\n");
 
   const schema = {
@@ -341,7 +466,12 @@ function repairJaOnly_(apiKey, imageDataUrl, meta) {
       additionalProperties: false,
       properties: {
         title_ja: { type: "string", minLength: 15, maxLength: 30 },
-        tags_ja: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } }
+        tags_ja: {
+          type: "array",
+          minItems: 49,
+          maxItems: 49,
+          items: { type: "string", minLength: 1, pattern: "^(?!.*[A-Za-z]).+$" }
+        }
       },
       required: ["title_ja", "tags_ja"]
     }
@@ -355,7 +485,7 @@ function repairJaOnly_(apiKey, imageDataUrl, meta) {
     },{
       role: "user",
       content: [
-        { type: "input_text", text: "Update JP fields based on this image. Current meta (EN keep same):\n" + JSON.stringify(meta) },
+        { type: "input_text", text: "Update JP fields for this image. Current meta (EN keep same):\n" + JSON.stringify(meta) },
         { type: "input_image", image_url: imageDataUrl }
       ]
     }],
@@ -369,14 +499,13 @@ function repairJaOnly_(apiKey, imageDataUrl, meta) {
   const ja = JSON.parse(txt);
 
   meta.title_ja = String(ja.title_ja || "").trim();
-  meta.tags_ja = uniq_(ja.tags_ja).filter(t => !isJunkTag_(t)).filter(t => !EN_LETTER_RE.test(String(t || ""))).slice(0, 49);
+  meta.tags_ja = sanitizeJapaneseTags_(uniq_(ja.tags_ja)).slice(0, 49);
 
-  // If still not 49 for any reason, pad by asking again is expensive; instead throw for visibility
+  // strict final assertions
   if (meta.tags_ja.length !== 49) throw new Error("JP tags count is not 49 after repair.");
-
-  // final banned-word check
-  if (containsBannedWord_(meta.title_ja, JP_TITLE_BANNED_WORDS)) throw new Error("JP title still contains banned words after repair.");
-  if (meta.title_ja.length < 15 || meta.title_ja.length > 30) throw new Error("JP title length out of range after repair.");
+  if (containsBannedWord_(meta.title_ja, JP_TITLE_BANNED_WORDS)) throw new Error("JP title contains banned words after repair.");
+  if (isSentenceLikeJapaneseTitle_(meta.title_ja)) throw new Error("JP title still looks like a sentence after repair.");
+  if (/風景/.test(meta.title_ja) || /の風景$/.test(meta.title_ja)) throw new Error("JP title still contains 風景 after repair.");
 
   return meta;
 }
@@ -399,6 +528,7 @@ function callOpenAI_(apiKey, payload) {
 
 function extractOutputText_(res) {
   if (res && typeof res.output_text === "string" && res.output_text.trim()) return res.output_text.trim();
+
   const outputs = (res && res.output) ? res.output : [];
   for (const out of outputs) {
     const contents = out.content || [];
@@ -430,29 +560,6 @@ function getOrCreateChildFolder_(parent, name) {
   return it.hasNext() ? it.next() : parent.createFolder(name);
 }
 
-function isSentenceLikeJapaneseTitle_(title) {
-  const t = String(title || "").trim();
-
-  // 明らかな“文章”終わり（丁寧語／断定）
-  if (/(です|ます|でした|ました|である|だ)$/.test(t)) return true;
-
-  // 「〜の写真です」「〜の画像です」系（よく出る）
-  if (/(写真|画像|風景)(です|である)$/.test(t)) return true;
-
-  // 動詞・述語で終わっているっぽい（名詞タイトルにしたいのでNG）
-  // 例：〜している / 〜見ている / 〜撮影した / 〜映す など
-  if (/(している|していた|しているところ|している様子|している風景)$/.test(t)) return true;
-  if (/(見ている|眺める|歩く|走る|座る|立つ|撮影した|捉えた|映す|映した|表現した|描いた)$/.test(t)) return true;
-
-  // 「〜です。」のような句点付きも文章扱い
-  if (/[。\.]$/.test(t)) return true;
-
-  // 「～の風景」という表現も除外
-  if (/の風景$/.test(t)) return true;
-
-  return false;
-}
-
 function makeDataUrl_(blob, mime) {
   const b64 = Utilities.base64Encode(blob.getBytes());
   return "data:" + mime + ";base64," + b64;
@@ -463,82 +570,58 @@ function uniq_(arr) {
   const out = [];
   (arr || []).forEach(s => {
     const v = String(s || "").trim();
-    if (!v) return;
-    if (seen.has(v)) return;
+    if (!v || seen.has(v)) return;
     seen.add(v);
     out.push(v);
   });
   return out;
 }
 
-function countWordOccurrences_(text, word) {
-  const re = new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g");
-  const m = String(text || "").match(re);
-  return m ? m.length : 0;
-}
-
 function containsBannedWord_(text, bannedList) {
   const t = String(text || "");
-  return bannedList.some(w => t.indexOf(w) !== -1);
+  return (bannedList || []).some(w => w && t.indexOf(w) !== -1);
+}
+
+// ✅ JP tags: remove English letters + junk keys + empty
+function sanitizeJapaneseTags_(tags) {
+  const out = [];
+  for (const t of (tags || [])) {
+    const s = String(t || "").trim();
+    if (!s) continue;
+    if (EN_LETTER_RE.test(s)) continue;
+    if (isJunkTag_(s)) continue;
+    out.push(s);
+  }
+  return out;
 }
 
 function isJunkTag_(tag) {
   const t = String(tag || "").trim();
   if (!t) return true;
   const lowered = t.toLowerCase();
-  // prevent JSON keys / accidental tokens
   if (lowered === "title_en" || lowered === "tags_en" || lowered === "title_ja" || lowered === "tags_ja") return true;
-  if (t === "title_en" || t === "tags_en" || t === "title_ja" || t === "tags_ja") return true;
   return false;
 }
 
-/**
- * スプレッドシートを開いたときにメニューを追加
- */
-function onOpen(e) {
-  SpreadsheetApp.getUi()
-    .createMenu("画像処理")
-    .addItem("処理を実行（タイトル＆タグ生成）", "runPipeline")
-    .addSeparator()
-    .addItem("処理フォルダの残り枚数を表示", "menu_showRemainingCount")
-    .addSeparator()
-    .addItem("実行状態をリセット（RunState削除）", "menu_clearRunState")
-    .addToUi();
-}
+// ✅ JP title: block sentence-like endings and common “caption sentence” patterns
+function isSentenceLikeJapaneseTitle_(title) {
+  const t = String(title || "").trim();
 
-/**
- * RunStateを消して、次回実行時に新しいスプレッドシートを作り直したい時用
- */
-function menu_clearRunState() {
-  clearRunState_(); // 既存のあなたの関数を呼ぶ
-  SpreadsheetApp.getUi().alert("実行状態（RunState）をリセットしました。次回実行で新しい出力シートが作られます。");
-}
+  // polite/statement endings (sentence)
+  if (/(です|ます|でした|ました|である|だ)$/.test(t)) return true;
 
-function menu_showRemainingCount() {
-  const root = DriveApp.getFolderById(ROOT_FOLDER_ID);
-  const processFolder = getOrCreateChildFolder_(root, PROCESS_FOLDER_NAME);
+  // “〜の写真です” style
+  if (/(写真|画像)(です|である)$/.test(t)) return true;
 
-  let total = 0;
-  let imageCount = 0;
-  let nonImageCount = 0;
+  // punctuation ending suggests sentence
+  if (/[。\.]$/.test(t)) return true;
 
-  const files = processFolder.getFiles();
-  while (files.hasNext()) {
-    const f = files.next();
-    total++;
+  // verb-ish endings (we want noun phrase)
+  if (/(している|していた|しているところ|している様子)$/.test(t)) return true;
+  if (/(見ている|眺める|歩く|走る|座る|立つ|撮影した|捉えた|映す|映した|表現した|描いた)$/.test(t)) return true;
 
-    const mime = f.getMimeType();
-    const isImage = (mime === "image/jpeg" || mime === "image/png" || mime === "image/webp");
+  // generic filler pattern
+  if (/の風景$/.test(t)) return true;
 
-    if (isImage) imageCount++;
-    else nonImageCount++;
-  }
-
-  const msg =
-    "処理フォルダ内の残り件数\n\n" +
-    "合計: " + total + " 件\n" +
-    "画像: " + imageCount + " 件\n" +
-    "画像以外: " + nonImageCount + " 件";
-
-  SpreadsheetApp.getUi().alert(msg);
+  return false;
 }
