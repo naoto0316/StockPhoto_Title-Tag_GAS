@@ -21,6 +21,19 @@ const JP_TITLE_BANNED_WORDS = [
 
 const EN_LETTER_RE = /[A-Za-z]/;
 
+
+
+// ===== Title anti-bias controls (JP) =====
+const TITLE_HISTORY_KEY = "TITLE_HISTORY_JP";
+const TITLE_HISTORY_MAX = 120;          // 直近N件を保持（シート削除運用でも効く）
+const TITLE_SIM_THRESHOLD = 0.55;       // 類似度が高いほど減点
+const JP_TITLE_CANDIDATES = 5;          // 候補数（固定5）
+
+// “偏りやすい定型句”は「禁止」ではなく軽く減点（自由度を保つ）
+const JP_TITLE_OVERUSED_PHRASES = [
+  "青空の下","背景","景観","光景","眺め","一面","広がる","見える","染まる"
+];
+
 /***** SPREADSHEET MENU *****/
 function onOpen(e) {
   SpreadsheetApp.getUi()
@@ -252,7 +265,12 @@ function generateMetadataStrict_(apiKey, imageDataUrl) {
     "- Avoid verb endings such as している / 見ている / 撮影した / 捉えた / 映す.",
     "- Do NOT use evaluative/emotional words (e.g., 美しい, 感動, 仕上げた).",
     "- Do NOT use the word '風景' in the Japanese title.",
-    "",
+    
+  "- Also output title_ja_candidates: 5 alternatives.",
+  "- The 5 candidates must differ in wording/order; avoid templates.",
+  "- Avoid overused phrases: 青空の下, 背景, 景観, 光景, 眺め, 一面, 広がる, 見える, 染まる.",
+  "- Verbs are allowed inside, but do NOT end with a verb (keep noun-phrase ending).",
+"",
     "[Tags rules]",
     "- Japanese tags: exactly 49 items, no duplicates.",
     "- Japanese tags must be Japanese-only. Do NOT include any English letters (A-Z/a-z).",
@@ -269,7 +287,8 @@ function generateMetadataStrict_(apiKey, imageDataUrl) {
       additionalProperties: false,
       properties: {
         title_ja: { type: "string", minLength: 1 },
-        tags_ja: {
+        title_ja_candidates: { type: "array", minItems: JP_TITLE_CANDIDATES, maxItems: JP_TITLE_CANDIDATES, items: { type: "string", minLength: 1, pattern: "^(?!.*[A-Za-z]).+$" } },
+tags_ja: {
           type: "array",
           minItems: 49,
           maxItems: 49,
@@ -278,7 +297,7 @@ function generateMetadataStrict_(apiKey, imageDataUrl) {
         title_en: { type: "string", minLength: 1 },
         tags_en: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } }
       },
-      required: ["title_ja", "tags_ja", "title_en", "tags_en"]
+      required: ["title_ja", "title_ja_candidates", "tags_ja", "title_en", "tags_en"]
     }
   };
 
@@ -308,7 +327,16 @@ function generateMetadataStrict_(apiKey, imageDataUrl) {
 
 function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
   meta.title_ja = String(meta.title_ja || "").trim();
-  meta.title_en = String(meta.title_en || "").trim();
+  
+  // ===== pick best JP title from candidates (anti-bias) =====
+  const history = getTitleHistoryFromProps_();
+  if (Array.isArray(meta.title_ja_candidates) && meta.title_ja_candidates.length) {
+    const picked = pickBestJapaneseTitle_(meta.title_ja_candidates, history);
+    if (picked) meta.title_ja = picked;
+  }
+  meta.title_ja = String(meta.title_ja || "").trim();
+
+meta.title_en = String(meta.title_en || "").trim();
 
   meta.tags_ja = uniq_(meta.tags_ja);
   meta.tags_en = uniq_(meta.tags_en);
@@ -335,6 +363,7 @@ function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
   if (!needsJaTitleFix && !needsJaTagsFix && !needsEnTitleFix && !needsEnTagsFix) {
     meta.tags_ja = meta.tags_ja.slice(0, 49);
     meta.tags_en = meta.tags_en.slice(0, 49);
+    pushTitleHistoryToProps_(meta.title_ja);
     return meta;
   }
 
@@ -360,7 +389,8 @@ function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
     "- English tags: exactly 49, no duplicates.",
     "",
     "Avoid overusing 日本 (prefer 0, max 1).",
-    "Output must strictly match the schema JSON only."
+    "Also output title_ja_candidates: 5 alternatives (same constraints).",
+  "Output must strictly match the schema JSON only."
   ].join("\n");
 
   const schema = {
@@ -371,6 +401,7 @@ function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
       additionalProperties: false,
       properties: {
         title_ja: { type: "string", minLength: 1 },
+        title_ja_candidates: { type: "array", minItems: JP_TITLE_CANDIDATES, maxItems: JP_TITLE_CANDIDATES, items: { type: "string", minLength: 1, pattern: "^(?!.*[A-Za-z]).+$" } },
         tags_ja: {
           type: "array",
           minItems: 49,
@@ -380,7 +411,7 @@ function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
         title_en: { type: "string", minLength: 1 },
         tags_en: { type: "array", minItems: 49, maxItems: 49, items: { type: "string", minLength: 1 } }
       },
-      required: ["title_ja", "tags_ja", "title_en", "tags_en"]
+      required: ["title_ja", "title_ja_candidates", "tags_ja", "title_en", "tags_en"]
     }
   };
 
@@ -423,6 +454,15 @@ function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
   out.tags_ja = sanitizeJapaneseTags_(uniq_(out.tags_ja)).slice(0, 49);
   out.tags_en = uniq_(out.tags_en).slice(0, 49);
 
+  
+  // ===== pick best JP title from candidates again (after fix) =====
+  const history2 = getTitleHistoryFromProps_();
+  if (Array.isArray(out.title_ja_candidates) && out.title_ja_candidates.length) {
+    const picked2 = pickBestJapaneseTitle_(out.title_ja_candidates, history2);
+    if (picked2) out.title_ja = picked2;
+  }
+  out.title_ja = String(out.title_ja || "").trim();
+
   // If still violated, do targeted JP repair
   const stillBad =
     out.title_ja.length < 15 || out.title_ja.length > 30 ||
@@ -436,6 +476,7 @@ function enforceRulesInGas_(apiKey, imageDataUrl, meta) {
     return repairJaOnly_(apiKey, imageDataUrl, out);
   }
 
+  pushTitleHistoryToProps_(out.title_ja);
   return out;
 }
 
@@ -507,6 +548,7 @@ function repairJaOnly_(apiKey, imageDataUrl, meta) {
   if (isSentenceLikeJapaneseTitle_(meta.title_ja)) throw new Error("JP title still looks like a sentence after repair.");
   if (/風景/.test(meta.title_ja) || /の風景$/.test(meta.title_ja)) throw new Error("JP title still contains 風景 after repair.");
 
+  pushTitleHistoryToProps_(meta.title_ja);
   return meta;
 }
 
