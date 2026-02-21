@@ -4,12 +4,22 @@ const PROCESS_FOLDER_NAME = "処理";
 const DONE_FOLDER_NAME = "完了";
 const ERROR_FOLDER_NAME = "失敗"; // optional
 
+// ===== JP fallback tags (only used when tags are <49 after sanitize/uniq) =====
+const JP_FALLBACK_TAG_POOL = [
+  "写真","素材","背景","余白","コピースペース","テクスチャ","パターン","模様","自然","屋外",
+  "晴天","青空","夕焼け","黄昏","シルエット","山","森","林","竹林","木道",
+  "小道","遊歩道","公園","庭園","花","桜","菜の花","植物","緑","草木",
+  "枝","つぼみ","和傘","石灯籠","布","刺繍","格子柄","電車","列車","街並み",
+  "建物","時計塔","海","砂浜","作業船","クレーン","春","季節","旅行","観光"
+];
+
 // ✅ precision priority
 const OPENAI_MODEL = "gpt-4o";
 
 // Safety controls
-const MAX_PER_RUN = 10;          // process up to N images per execution
-const SAFE_STOP_MS = 320000;     // stop around 5m20s (6min limit margin)
+const MAX_PER_RUN = 6;          // process up to N images per execution
+// 320000(約5:20) → 280000(約4:40) 推奨
+const SAFE_STOP_MS = 280000; // 4分40秒くらい
 
 // Japanese title ban list（主観/感情/演出＋冗長語）
 const JP_TITLE_BANNED_WORDS = [
@@ -153,7 +163,12 @@ function runPipelineWithSummary_() {
       try {
         const imageDataUrl = makeDataUrl_(file.getBlob(), mime);
 
+        if (Date.now() - startMs > SAFE_STOP_MS) break;
+
         const meta = generateMetadataStrict_(apiKey, imageDataUrl);
+
+        if (Date.now() - startMs > SAFE_STOP_MS) break;
+
         const fixed = enforceRulesInGas_(apiKey, imageDataUrl, meta);
 
         rowsJa.push(buildRowJa_(file, fixed));
@@ -534,7 +549,7 @@ function repairJaOnly_(apiKey, imageDataUrl, meta) {
   };
 
   // ===== retry repair for JP tags (because sanitize/uniq can drop items) =====
-  const MAX_REPAIR_TRIES = 2; // 1回目 + 再試行1回（必要なら3にしてOK）
+  const MAX_REPAIR_TRIES = 3; // 1回目 + 再試行1回（必要なら3にしてOK）
   let lastCount = 0;
   let lastErr = null;
 
@@ -583,10 +598,18 @@ function repairJaOnly_(apiKey, imageDataUrl, meta) {
     }
   }
 
-  // 最終的にも49でなければ従来通り失敗扱い（思想維持）
+  // 最終的に49未満でも、ローカル補完で必ず49にする（運用停止を防ぐ）
   if (!meta.tags_ja || meta.tags_ja.length !== 49) {
-    throw lastErr || new Error("JP tags count is not 49 after repair. got=" + lastCount);
+    // 最後に取得できた候補があるならそれを使う（無ければ既存meta.tags_ja）
+    const base = meta.tags_ja || [];
+    meta.tags_ja = fillTo49JapaneseTags_(base);
   }
+
+  // 念のため最終チェック
+  if (meta.tags_ja.length !== 49) {
+    throw lastErr || new Error("JP tags count is not 49 after repair. got=" + meta.tags_ja.length);
+  }
+
   if (containsBannedWord_(meta.title_ja, JP_TITLE_BANNED_WORDS)) throw new Error("JP title contains banned words after repair.");
   if (isSentenceLikeJapaneseTitle_(meta.title_ja)) throw new Error("JP title still looks like a sentence after repair.");
   if (/風景/.test(meta.title_ja) || /の風景$/.test(meta.title_ja)) throw new Error("JP title still contains 風景 after repair.");
@@ -775,6 +798,22 @@ function isSentenceLikeJapaneseTitle_(title) {
   if (/の風景$/.test(t)) return true;
 
   return false;
+}
+
+function fillTo49JapaneseTags_(tags) {
+  let out = uniq_(sanitizeJapaneseTags_(tags));
+  const used = new Set(out);
+
+  for (const cand of JP_FALLBACK_TAG_POOL) {
+    if (out.length >= 49) break;
+    const t = String(cand || "").trim();
+    if (!t) continue;
+    if (EN_LETTER_RE.test(t)) continue;
+    if (used.has(t)) continue;
+    out.push(t);
+    used.add(t);
+  }
+  return out.slice(0, 49);
 }
 
 /***** JP Title anti-bias utils (add) *****/
