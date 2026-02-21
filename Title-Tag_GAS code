@@ -697,3 +697,102 @@ function isSentenceLikeJapaneseTitle_(title) {
 
   return false;
 }
+
+/***** JP Title anti-bias utils (add) *****/
+
+// ※ CONFIGに以下が無い場合は追加してください（既にあるなら不要）
+// const TITLE_HISTORY_KEY = "TITLE_HISTORY_JP";
+// const TITLE_HISTORY_MAX = 120;
+// const TITLE_SIM_THRESHOLD = 0.55;
+// const JP_TITLE_OVERUSED_PHRASES = ["青空の下","背景","景観","光景","眺め","一面","広がる","見える","染まる"];
+
+function getTitleHistoryFromProps_() {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(TITLE_HISTORY_KEY) || "[]";
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function pushTitleHistoryToProps_(title) {
+  const t = String(title || "").trim();
+  if (!t) return;
+
+  const props = PropertiesService.getScriptProperties();
+  const arr = getTitleHistoryFromProps_();
+  arr.unshift(t);
+  while (arr.length > TITLE_HISTORY_MAX) arr.pop();
+  props.setProperty(TITLE_HISTORY_KEY, JSON.stringify(arr));
+}
+
+function ngrams_(s, n) {
+  const t = String(s || "").trim();
+  const out = new Set();
+  if (t.length < n) return out;
+  for (let i = 0; i <= t.length - n; i++) out.add(t.slice(i, i + n));
+  return out;
+}
+
+function jaccard_(aSet, bSet) {
+  if (!aSet.size || !bSet.size) return 0;
+  let inter = 0;
+  for (const x of aSet) if (bSet.has(x)) inter++;
+  const union = aSet.size + bSet.size - inter;
+  return union ? inter / union : 0;
+}
+
+function maxSimilarityToHistory_(title, history) {
+  const a = ngrams_(title, 3); // 3-gram
+  let max = 0;
+  for (const h of (history || [])) {
+    const sim = jaccard_(a, ngrams_(h, 3));
+    if (sim > max) max = sim;
+  }
+  return max;
+}
+
+function scoreJapaneseTitleCandidate_(title, history) {
+  const t = String(title || "").trim();
+  if (!t) return -9999;
+
+  // ✅ 既存思想：ルール違反は即死
+  if (t.length < 15 || t.length > 30) return -9999;
+  if (EN_LETTER_RE.test(t)) return -9999;
+  if (containsBannedWord_(t, JP_TITLE_BANNED_WORDS)) return -9999;
+  if (isSentenceLikeJapaneseTitle_(t)) return -9999;
+  if (/の風景$/.test(t) || /風景/.test(t)) return -9999;
+
+  let score = 1000;
+
+  // 定型句は“弱”減点（禁止しない）
+  for (const p of (JP_TITLE_OVERUSED_PHRASES || [])) {
+    if (t.includes(p)) score -= 40;
+  }
+
+  // 「と」の羅列抑制
+  const andCount = (t.match(/と/g) || []).length;
+  if (andCount >= 3) score -= 60;
+
+  // 直近履歴との類似度ペナルティ
+  const sim = maxSimilarityToHistory_(t, history);
+  score -= (sim >= TITLE_SIM_THRESHOLD) ? Math.round(600 * sim) : Math.round(200 * sim);
+
+  return score;
+}
+
+function pickBestJapaneseTitle_(candidates, history) {
+  let best = "";
+  let bestScore = -9999;
+
+  for (const c of (candidates || [])) {
+    const sc = scoreJapaneseTitleCandidate_(c, history);
+    if (sc > bestScore) {
+      bestScore = sc;
+      best = String(c || "").trim();
+    }
+  }
+  return best;
+}
