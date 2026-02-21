@@ -596,16 +596,22 @@ function repairJaOnly_(apiKey, imageDataUrl, meta) {
 }
 
 /***** OPENAI low-level *****/
-function callOpenAI_(url, payload, headers) {
-  const MAX_TRIES = 4;           // 1 + リトライ3回
-  const BASE_SLEEP_MS = 800;     // 0.8s → 1.6s → 3.2s…
+function callOpenAI_(apiKey, payload) {
+  const url = "https://api.openai.com/v1/responses";
+
+  const headers = {
+    Authorization: "Bearer " + apiKey,
+  };
+
+  const MAX_TRIES = 4;        // リトライ込み
+  const BASE_SLEEP_MS = 800;
 
   let lastText = "";
   for (let i = 0; i < MAX_TRIES; i++) {
     const res = UrlFetchApp.fetch(url, {
       method: "post",
       contentType: "application/json",
-      headers: headers,
+      headers,
       payload: JSON.stringify(payload),
       muteHttpExceptions: true,
     });
@@ -614,10 +620,12 @@ function callOpenAI_(url, payload, headers) {
     const text = res.getContentText();
     lastText = text;
 
-    // 成功
-    if (code >= 200 && code < 300) return safeJsonParse_(text);
+    if (code >= 200 && code < 300) {
+      // ここは「OpenAIレスポンス全体(JSON)」を返す想定（あなたの既存処理に合わせる）
+      return JSON.parse(text);
+    }
 
-    // 解析して retry 判定
+    // retry 判定（500系/429/model_errorは再試行）
     let errType = "";
     try {
       const j = JSON.parse(text);
@@ -633,9 +641,7 @@ function callOpenAI_(url, payload, headers) {
       throw new Error(`OpenAI error ${code}: ${text}`);
     }
 
-    // バックオフ + ジッター
-    const sleep = BASE_SLEEP_MS * Math.pow(2, i) + Math.floor(Math.random() * 250);
-    Utilities.sleep(sleep);
+    Utilities.sleep(BASE_SLEEP_MS * Math.pow(2, i) + Math.floor(Math.random() * 250));
   }
 
   throw new Error(`OpenAI error: ${lastText}`);
