@@ -533,17 +533,60 @@ function repairJaOnly_(apiKey, imageDataUrl, meta) {
     text: { format: { type: "json_schema", ...schema } }
   };
 
-  const res = callOpenAI_(apiKey, payload);
-  const txt = extractOutputText_(res);
-  if (!txt) throw new Error("Model output is empty (repairJaOnly).");
+  // ===== retry repair for JP tags (because sanitize/uniq can drop items) =====
+  const MAX_REPAIR_TRIES = 2; // 1回目 + 再試行1回（必要なら3にしてOK）
+  let lastCount = 0;
+  let lastErr = null;
 
-  const ja = safeJsonParse_(txt);
+  for (let i = 0; i < MAX_REPAIR_TRIES; i++) {
+    try {
+      // 2回目以降は「49個に必ず埋める」指示を強める
+      const extraInstr = (i === 0) ? "" : [
+        "",
+        "【再修正】前回はタグが49個に満たなかった。",
+        "- 重複・英字・記号を避け、必ず49個の日本語タグに埋めること。",
+        "- 各タグは短い名詞（単語）にすること。",
+        "- 似た語でもよいので不足分を補完して49個にすること。"
+      ].join("\n");
 
-  meta.title_ja = String(ja.title_ja || "").trim();
-  meta.tags_ja = sanitizeJapaneseTags_(uniq_(ja.tags_ja)).slice(0, 49);
+      // payload を「このループ内で」作り直す（extraInstr を user text に追記）
+      const payload2 = JSON.parse(JSON.stringify(payload));
+      // user の input_text を探して末尾に追記（構造はあなたの既存payloadに合わせた安全なやり方）
+      const user = payload2.input.find(x => x.role === "user");
+      const t = user.content.find(c => c.type === "input_text");
+      t.text = t.text + extraInstr;
 
-  // strict final assertions
-  if (meta.tags_ja.length !== 49) throw new Error("JP tags count is not 49 after repair.");
+      const res = callOpenAI_(apiKey, payload2);
+      const txt = extractOutputText_(res);
+      if (!txt) throw new Error("Model output is empty (repairJaOnly).");
+
+      const ja = safeJsonParse_(txt);
+
+      // title は普通に採用
+      meta.title_ja = String(ja.title_ja || "").trim();
+
+      // tags は「浄化→重複除去」した結果で厳密に49を狙う
+      let tags = uniq_(sanitizeJapaneseTags_(ja.tags_ja));
+      lastCount = tags.length;
+
+      if (tags.length === 49) {
+        meta.tags_ja = tags;
+        lastErr = null;
+        break; // 成功
+      }
+
+      // 49に満たない場合：次ループで強指示して再生成
+      lastErr = new Error("JP tags count is not 49 after repair. got=" + tags.length);
+
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  // 最終的にも49でなければ従来通り失敗扱い（思想維持）
+  if (!meta.tags_ja || meta.tags_ja.length !== 49) {
+    throw lastErr || new Error("JP tags count is not 49 after repair. got=" + lastCount);
+  }
   if (containsBannedWord_(meta.title_ja, JP_TITLE_BANNED_WORDS)) throw new Error("JP title contains banned words after repair.");
   if (isSentenceLikeJapaneseTitle_(meta.title_ja)) throw new Error("JP title still looks like a sentence after repair.");
   if (/風景/.test(meta.title_ja) || /の風景$/.test(meta.title_ja)) throw new Error("JP title still contains 風景 after repair.");
@@ -553,19 +596,49 @@ function repairJaOnly_(apiKey, imageDataUrl, meta) {
 }
 
 /***** OPENAI low-level *****/
-function callOpenAI_(apiKey, payload) {
-  const url = "https://api.openai.com/v1/responses";
-  const res = UrlFetchApp.fetch(url, {
-    method: "post",
-    contentType: "application/json",
-    headers: { Authorization: "Bearer " + apiKey },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  });
+function callOpenAI_(url, payload, headers) {
+  const MAX_TRIES = 4;           // 1 + リトライ3回
+  const BASE_SLEEP_MS = 800;     // 0.8s → 1.6s → 3.2s…
 
-  const text = res.getContentText();
-  if (res.getResponseCode() >= 400) throw new Error("OpenAI error " + res.getResponseCode() + ": " + text);
-  return JSON.parse(text);
+  let lastText = "";
+  for (let i = 0; i < MAX_TRIES; i++) {
+    const res = UrlFetchApp.fetch(url, {
+      method: "post",
+      contentType: "application/json",
+      headers: headers,
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+
+    const code = res.getResponseCode();
+    const text = res.getContentText();
+    lastText = text;
+
+    // 成功
+    if (code >= 200 && code < 300) return safeJsonParse_(text);
+
+    // 解析して retry 判定
+    let errType = "";
+    try {
+      const j = JSON.parse(text);
+      errType = j?.error?.type || "";
+    } catch (_) {}
+
+    const retryable =
+      (code === 429) ||
+      (code >= 500 && code <= 504) ||
+      (errType === "model_error");
+
+    if (!retryable || i === MAX_TRIES - 1) {
+      throw new Error(`OpenAI error ${code}: ${text}`);
+    }
+
+    // バックオフ + ジッター
+    const sleep = BASE_SLEEP_MS * Math.pow(2, i) + Math.floor(Math.random() * 250);
+    Utilities.sleep(sleep);
+  }
+
+  throw new Error(`OpenAI error: ${lastText}`);
 }
 
 function extractOutputText_(res) {
