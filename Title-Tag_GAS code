@@ -182,7 +182,12 @@ function runPipelineWithSummary_() {
 
       } catch (e) {
         failed++;
-        try { logFailure_(ssJa.getId(), file.getName(), e); } catch (_) {}
+        try {
+          const titleInfo = (typeof meta !== "undefined" && meta?.title_ja)
+            ? " | TITLE=" + meta.title_ja
+            : "";
+          logFailure_(ssJa.getId(), file.getName(), e + titleInfo);
+        } catch (_) {}
 
         try {
           errorFolder.addFile(file);
@@ -610,7 +615,10 @@ function repairJaOnly_(apiKey, imageDataUrl, meta) {
     throw lastErr || new Error("JP tags count is not 49 after repair. got=" + meta.tags_ja.length);
   }
 
-  if (containsBannedWord_(meta.title_ja, JP_TITLE_BANNED_WORDS)) throw new Error("JP title contains banned words after repair.");
+  if (containsBannedWord_(meta.title_ja, JP_TITLE_BANNED_WORDS)) {
+    Logger.log("NG TITLE AFTER REPAIR: " + meta.title_ja);
+    throw new Error("JP title contains banned words after repair.");
+  }
   if (isSentenceLikeJapaneseTitle_(meta.title_ja)) throw new Error("JP title still looks like a sentence after repair.");
   if (/風景/.test(meta.title_ja) || /の風景$/.test(meta.title_ja)) throw new Error("JP title still contains 風景 after repair.");
 
