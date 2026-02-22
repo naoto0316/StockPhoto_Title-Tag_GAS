@@ -170,6 +170,7 @@ function runPipelineWithSummary_() {
         if (Date.now() - startMs > SAFE_STOP_MS) break;
 
         const fixed = enforceRulesInGas_(apiKey, imageDataUrl, meta);
+        Logger.log("OK TITLE: " + fixed.title_ja + " | FILE=" + file.getName());
 
         rowsJa.push(buildRowJa_(file, fixed));
         rowsEn.push(buildRowEn_(file, fixed));
